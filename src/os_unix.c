@@ -692,9 +692,13 @@ static ssize_t zipped_read(int handle,void* buf,size_t length, off_t offset) {
         }
 
 	unsigned char bufchunk[CHUNK];
+#ifdef ZIPDEBUG
 	printf("Extracting len=%d off=%d\n", length, offset);
+#endif
 	ssize_t ret = extract(gzin, gzindex, offset, bufchunk, CHUNK);
+#ifdef ZIPDEBUG
 	printf("Read %d 0x%02X 0x%02X 0x%02X...\n", ret, bufchunk[0], bufchunk[1], bufchunk[2]);
+#endif
 	if (ret < 0) return ret;
 	ssize_t actualread = length < ret ? length : ret;
 
@@ -704,7 +708,10 @@ if ((length == 16) && (offset == 24)) {
         }
 
 	memcpy(buf, bufchunk, actualread);
+#ifdef ZIPDEBUG
+	printf("Read %d 0x%02X 0x%02X 0x%02X...\n", ret, bufchunk[0], bufchunk[1], bufchunk[2]);
 	printf("Returning %d %02X\n", actualread, ((unsigned char*) buf)[0]);
+#endif
 
 	return actualread;
 }
@@ -4020,7 +4027,10 @@ static int unixFileSize(sqlite3_file *id, i64 *pSize){
      return SQLITE_IOERR_FSTAT;
    }
 
-  *pSize = CHUNK * gzlen;
+  *pSize = atoi(getenv("CONTENT_LENGTH"));
+#ifdef ZIPDEBUG
+  fprintf(stderr, "returning length %d\n", *pSize);
+#endif
 
   // *pSize = buf.st_size;
 
