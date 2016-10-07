@@ -3998,22 +3998,25 @@ static int unixTruncate(sqlite3_file *id, i64 nByte){
 static int unixFileSize(sqlite3_file *id, i64 *pSize){
   int rc;
   struct stat buf;
-  assert( id );
-  rc = osFstat(((unixFile*)id)->h, &buf);
-  SimulateIOError( rc=1 );
-  if( rc!=0 ){
-    storeLastErrno((unixFile*)id, errno);
-    return SQLITE_IOERR_FSTAT;
-  }
-  *pSize = buf.st_size;
 
-  /* When opening a zero-size database, the findInodeInfo() procedure
-  ** writes a single byte into that file in order to work around a bug
-  ** in the OS-X msdos filesystem.  In order to avoid problems with upper
-  ** layers, we need to report this file size as zero even though it is
-  ** really 1.   Ticket #3260.
-  */
-  if( *pSize==1 ) *pSize = 0;
+
+   assert( id );
+   if (((unixFile*)id)->h != 3) {
+	   fprintf(stderr, "reading a file length on unknown fd\n");
+     return SQLITE_IOERR_FSTAT;
+   }
+
+  *pSize = CHUNK * gzlen;
+
+  // *pSize = buf.st_size;
+
+  // /* When opening a zero-size database, the findInodeInfo() procedure
+  // ** writes a single byte into that file in order to work around a bug
+  // ** in the OS-X msdos filesystem.  In order to avoid problems with upper
+  // ** layers, we need to report this file size as zero even though it is
+  // ** really 1.   Ticket #3260.
+  // */
+  // if( *pSize==1 ) *pSize = 0;
 
 
   return SQLITE_OK;
