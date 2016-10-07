@@ -4027,7 +4027,7 @@ static int unixFileSize(sqlite3_file *id, i64 *pSize){
      return SQLITE_IOERR_FSTAT;
    }
 
-  *pSize = atoi(getenv("CONTENT_LENGTH"));
+  *pSize = atol(getenv("CONTENT_LENGTH"));
 #ifdef ZIPDEBUG
   fprintf(stderr, "returning length %d\n", *pSize);
 #endif
