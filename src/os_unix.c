@@ -44,6 +44,7 @@
 **      plus implementations of sqlite3_os_init() and sqlite3_os_end().
 */
 #include "sqliteInt.h"
+#include "zlib.h"
 #if SQLITE_OS_UNIX              /* This file is used on unix only */
 
 /*
@@ -72,17 +73,21 @@
 #endif
 
 /* Use pread() and pwrite() if they are available */
-#if defined(__APPLE__)
-# define HAVE_PREAD 1
-# define HAVE_PWRITE 1
-#endif
-#if defined(HAVE_PREAD64) && defined(HAVE_PWRITE64)
-# undef USE_PREAD
-# define USE_PREAD64 1
-#elif defined(HAVE_PREAD) && defined(HAVE_PWRITE)
-# undef USE_PREAD64
-# define USE_PREAD 1
-#endif
+//#if defined(__APPLE__)
+//# define HAVE_PREAD 1
+//# define HAVE_PWRITE 1
+//#endif
+//#if defined(HAVE_PREAD64) && defined(HAVE_PWRITE64)
+//# undef USE_PREAD
+//# define USE_PREAD64 1
+//#elif defined(HAVE_PREAD) && defined(HAVE_PWRITE)
+//# undef USE_PREAD64
+//# define USE_PREAD 1
+//#endif
+//
+#define HAVE_PREAD 1
+#define HAVE_PWRITE 1
+#define USE_PREAD 1
 
 /*
 ** standard include files.
@@ -328,6 +333,301 @@ static pid_t randomnessPid = 0;
 # define lseek lseek64
 #endif
 
+/* gzip compression - https://github.com/madler/zlib/blob/master/examples/zran.c */
+#define local static
+
+#define SPAN 1048576L       /* desired distance between access points */
+#define WINSIZE 32768U      /* sliding window size */
+#define CHUNK 16384         /* file input buffer size */
+
+/* access point entry */
+struct point {
+    off_t out;          /* corresponding offset in uncompressed data */
+    off_t in;           /* offset in input file of first full byte */
+    int bits;           /* number of bits (1-7) from byte at in - 1, or 0 */
+    unsigned char window[WINSIZE];  /* preceding 32K of uncompressed data */
+};
+
+/* access point list */
+struct access {
+    int have;           /* number of list entries filled in */
+    int size;           /* number of list entries allocated */
+    struct point *list; /* allocated list */
+};
+
+/* Deallocate an index built by build_index() */
+local void free_index(struct access *index)
+{
+    if (index != NULL) {
+        free(index->list);
+        free(index);
+    }
+}
+
+/* Add an entry to the access point list.  If out of memory, deallocate the
+   existing list and return NULL. */
+local struct access *addpoint(struct access *index, int bits,
+    off_t in, off_t out, unsigned left, unsigned char *window)
+{
+    struct point *next;
+
+    /* if list is empty, create it (start with eight points) */
+    if (index == NULL) {
+        index = malloc(sizeof(struct access));
+        if (index == NULL) return NULL;
+        index->list = malloc(sizeof(struct point) << 3);
+        if (index->list == NULL) {
+            free(index);
+            return NULL;
+        }
+        index->size = 8;
+        index->have = 0;
+    }
+
+    /* if list is full, make it bigger */
+    else if (index->have == index->size) {
+        index->size <<= 1;
+        next = realloc(index->list, sizeof(struct point) * index->size);
+        if (next == NULL) {
+            free_index(index);
+            return NULL;
+        }
+        index->list = next;
+    }
+
+    /* fill in entry and increment how many we have */
+    next = index->list + index->have;
+    next->bits = bits;
+    next->in = in;
+    next->out = out;
+    if (left)
+        memcpy(next->window, window + WINSIZE - left, left);
+    if (left < WINSIZE)
+        memcpy(next->window + left, window, WINSIZE - left);
+    index->have++;
+
+    /* return list, possibly reallocated */
+    return index;
+}
+
+/* Make one entire pass through the compressed stream and build an index, with
+   access points about every span bytes of uncompressed output -- span is
+   chosen to balance the speed of random access against the memory requirements
+   of the list, about 32K bytes per access point.  Note that data after the end
+   of the first zlib or gzip stream in the file is ignored.  build_index()
+   returns the number of access points on success (>= 1), Z_MEM_ERROR for out
+   of memory, Z_DATA_ERROR for an error in the input file, or Z_ERRNO for a
+   file read error.  On success, *built points to the resulting index. */
+local int build_index(FILE *in, off_t span, struct access **built)
+{
+    int ret;
+    off_t totin, totout;        /* our own total counters to avoid 4GB limit */
+    off_t last;                 /* totout value of last access point */
+    struct access *index;       /* access points being generated */
+    z_stream strm;
+    unsigned char input[CHUNK];
+    unsigned char window[WINSIZE];
+
+    /* initialize inflate */
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit2(&strm, 47);      /* automatic zlib or gzip decoding */
+    if (ret != Z_OK)
+        return ret;
+
+    /* inflate the input, maintain a sliding window, and build an index -- this
+       also validates the integrity of the compressed data using the check
+       information at the end of the gzip or zlib stream */
+    totin = totout = last = 0;
+    index = NULL;               /* will be allocated by first addpoint() */
+    strm.avail_out = 0;
+    do {
+        /* get some compressed data from input file */
+        strm.avail_in = fread(input, 1, CHUNK, in);
+        if (ferror(in)) {
+            ret = Z_ERRNO;
+            goto build_index_error;
+        }
+        if (strm.avail_in == 0) {
+            ret = Z_DATA_ERROR;
+            goto build_index_error;
+        }
+        strm.next_in = input;
+
+        /* process all of that, or until end of stream */
+        do {
+            /* reset sliding window if necessary */
+            if (strm.avail_out == 0) {
+                strm.avail_out = WINSIZE;
+                strm.next_out = window;
+            }
+
+            /* inflate until out of input, output, or at end of block --
+               update the total input and output counters */
+            totin += strm.avail_in;
+            totout += strm.avail_out;
+            ret = inflate(&strm, Z_BLOCK);      /* return at end of block */
+            totin -= strm.avail_in;
+            totout -= strm.avail_out;
+            if (ret == Z_NEED_DICT)
+                ret = Z_DATA_ERROR;
+            if (ret == Z_MEM_ERROR || ret == Z_DATA_ERROR)
+                goto build_index_error;
+            if (ret == Z_STREAM_END)
+                break;
+
+            /* if at end of block, consider adding an index entry (note that if
+               data_type indicates an end-of-block, then all of the
+               uncompressed data from that block has been delivered, and none
+               of the compressed data after that block has been consumed,
+               except for up to seven bits) -- the totout == 0 provides an
+               entry point after the zlib or gzip header, and assures that the
+               index always has at least one access point; we avoid creating an
+               access point after the last block by checking bit 6 of data_type
+             */
+            if ((strm.data_type & 128) && !(strm.data_type & 64) &&
+                (totout == 0 || totout - last > span)) {
+                index = addpoint(index, strm.data_type & 7, totin,
+                                 totout, strm.avail_out, window);
+                if (index == NULL) {
+                    ret = Z_MEM_ERROR;
+                    goto build_index_error;
+                }
+                last = totout;
+            }
+        } while (strm.avail_in != 0);
+    } while (ret != Z_STREAM_END);
+
+    /* clean up and return index (release unused entries in list) */
+    (void)inflateEnd(&strm);
+    index->list = realloc(index->list, sizeof(struct point) * index->have);
+    index->size = index->have;
+    *built = index;
+    return index->size;
+
+    /* return error */
+  build_index_error:
+    (void)inflateEnd(&strm);
+    if (index != NULL)
+        free_index(index);
+    return ret;
+}
+
+/* Use the index to read len bytes from offset into buf, return bytes read or
+   negative for error (Z_DATA_ERROR or Z_MEM_ERROR).  If data is requested past
+   the end of the uncompressed data, then extract() will return a value less
+   than len, indicating how much as actually read into buf.  This function
+   should not return a data error unless the file was modified since the index
+   was generated.  extract() may also return Z_ERRNO if there is an error on
+   reading or seeking the input file. */
+local int extract(FILE *in, struct access *index, off_t offset,
+                  unsigned char *buf, int len)
+{
+    int ret, skip;
+    z_stream strm;
+    struct point *here;
+    unsigned char input[CHUNK];
+    unsigned char discard[WINSIZE];
+
+    /* proceed only if something reasonable to do */
+    if (len < 0)
+        return 0;
+
+    /* find where in stream to start */
+    here = index->list;
+    ret = index->have;
+    while (--ret && here[1].out <= offset)
+        here++;
+
+    /* initialize file and inflate state to start there */
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit2(&strm, -15);         /* raw inflate */
+    if (ret != Z_OK)
+        return ret;
+    ret = fseeko(in, here->in - (here->bits ? 1 : 0), SEEK_SET);
+    if (ret == -1)
+        goto extract_ret;
+    if (here->bits) {
+        ret = getc(in);
+        if (ret == -1) {
+            ret = ferror(in) ? Z_ERRNO : Z_DATA_ERROR;
+            goto extract_ret;
+        }
+        (void)inflatePrime(&strm, here->bits, ret >> (8 - here->bits));
+    }
+    (void)inflateSetDictionary(&strm, here->window, WINSIZE);
+
+    /* skip uncompressed bytes until offset reached, then satisfy request */
+    offset -= here->out;
+    strm.avail_in = 0;
+    skip = 1;                               /* while skipping to offset */
+    do {
+        /* define where to put uncompressed data, and how much */
+        if (offset == 0 && skip) {          /* at offset now */
+            strm.avail_out = len;
+            strm.next_out = buf;
+            skip = 0;                       /* only do this once */
+        }
+        if (offset > WINSIZE) {             /* skip WINSIZE bytes */
+            strm.avail_out = WINSIZE;
+            strm.next_out = discard;
+            offset -= WINSIZE;
+        }
+        else if (offset != 0) {             /* last skip */
+            strm.avail_out = (unsigned)offset;
+            strm.next_out = discard;
+            offset = 0;
+        }
+
+        /* uncompress until avail_out filled, or end of stream */
+        do {
+            if (strm.avail_in == 0) {
+                strm.avail_in = fread(input, 1, CHUNK, in);
+                if (ferror(in)) {
+                    ret = Z_ERRNO;
+                    goto extract_ret;
+                }
+                if (strm.avail_in == 0) {
+                    ret = Z_DATA_ERROR;
+                    goto extract_ret;
+                }
+                strm.next_in = input;
+            }
+            ret = inflate(&strm, Z_NO_FLUSH);       /* normal inflate */
+            if (ret == Z_NEED_DICT)
+                ret = Z_DATA_ERROR;
+            if (ret == Z_MEM_ERROR || ret == Z_DATA_ERROR)
+                goto extract_ret;
+            if (ret == Z_STREAM_END)
+                break;
+        } while (strm.avail_out != 0);
+
+        /* if reach end of stream, then don't keep trying to get more */
+        if (ret == Z_STREAM_END)
+            break;
+
+        /* do until offset reached and requested data read, or stream ends */
+    } while (skip);
+
+    /* compute number of uncompressed bytes read after offset */
+    ret = skip ? 0 : len - strm.avail_out;
+
+    /* clean up and return bytes read or error */
+  extract_ret:
+    (void)inflateEnd(&strm);
+    return ret;
+}
+
+/******/
+
+
 /*
 ** Different Unix systems declare open() in different ways.  Same use
 ** open(const char*,int,mode_t).  Others use open(const char*,int,...).
@@ -336,13 +636,58 @@ static pid_t randomnessPid = 0;
 ** The safest way to deal with the problem is to always use this wrapper
 ** which always has the same well-defined interface.
 */
+
+int gzlen;
+off_t gz_offset;
+FILE *gzin;
+struct access *gzindex = NULL;
+unsigned char gzbuf[CHUNK];
+
 static int posixOpen(const char *zFile, int flags, int mode){
-  return open(zFile, flags, mode);
+  printf("Open %s\n", zFile);
+  int fd = open(zFile, flags, mode);
+  gzin = fdopen(fd, "rb");
+  if (gzin == NULL) {
+    fprintf(stderr, "zran: could not open %s for reading - %s\n", zFile, strerror(errno));
+    return -1;
+  }
+
+    /* build index */
+    gzlen = build_index(gzin, SPAN, &gzindex);
+    if (gzlen < 0) {
+        fclose(gzin);
+        switch (gzlen) {
+        case Z_MEM_ERROR:
+            fprintf(stderr, "zran: out of memory\n");
+            break;
+        case Z_DATA_ERROR:
+            fprintf(stderr, "zran: compressed data error in %s\n", zFile);
+            break;
+        case Z_ERRNO:
+            fprintf(stderr, "zran: read error on %s\n", zFile);
+            break;
+        default:
+            fprintf(stderr, "zran: error %d while building index\n", gzlen);
+        }
+        return -1;
+    }
+    fprintf(stderr, "zran: built index with %d access points\n", gzlen);
+
+  return fd;
 }
 
 /* Forward reference */
 static int openDirectory(const char*, int*);
 static int unixGetpagesize(void);
+
+
+static ssize_t zipped_read(int handle,void* buf,size_t length, off_t offset) {
+	printf("Extracting len=%d off=%d\n", length, offset);
+	ssize_t ret = extract(gzin, gzindex, offset, buf, CHUNK);
+	printf("Read %d\n", ret);
+	return ret;
+}
+/******/
 
 /*
 ** Many system calls are accessed through pointer-to-functions so that
@@ -390,11 +735,11 @@ static struct unix_syscall {
   { "fcntl",        (sqlite3_syscall_ptr)fcntl,      0  },
 #define osFcntl     ((int(*)(int,int,...))aSyscall[7].pCurrent)
 
-  { "read",         (sqlite3_syscall_ptr)read,       0  },
+  { "read",         (sqlite3_syscall_ptr)0,       0  },
 #define osRead      ((ssize_t(*)(int,void*,size_t))aSyscall[8].pCurrent)
 
 #if defined(USE_PREAD) || SQLITE_ENABLE_LOCKING_STYLE
-  { "pread",        (sqlite3_syscall_ptr)pread,      0  },
+  { "pread",        (sqlite3_syscall_ptr)zipped_read,      0  },
 #else
   { "pread",        (sqlite3_syscall_ptr)0,          0  },
 #endif
