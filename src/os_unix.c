@@ -682,12 +682,26 @@ static int unixGetpagesize(void);
 
 
 static ssize_t zipped_read(int handle,void* buf,size_t length, off_t offset) {
+        static char buf1624[24];
+        static int  buf1624read = 0;
+
+        // this block is read everytime (locking?)
+        if ((length == 16) && (offset == 24) && buf1624read) {
+                memcpy(buf, buf1624, 16);
+                return 16;
+        }
+
 	unsigned char bufchunk[CHUNK];
 	printf("Extracting len=%d off=%d\n", length, offset);
 	ssize_t ret = extract(gzin, gzindex, offset, bufchunk, CHUNK);
 	printf("Read %d 0x%02X 0x%02X 0x%02X...\n", ret, bufchunk[0], bufchunk[1], bufchunk[2]);
 	if (ret < 0) return ret;
 	ssize_t actualread = length < ret ? length : ret;
+
+if ((length == 16) && (offset == 24)) {
+                buf1624read = 1;
+                memcpy(buf1624, bufchunk, 16);
+        }
 
 	memcpy(buf, bufchunk, actualread);
 	printf("Returning %d %02X\n", actualread, ((unsigned char*) buf)[0]);
