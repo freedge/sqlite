@@ -642,6 +642,7 @@ off_t gz_offset;
 FILE *gzin;
 struct access *gzindex = NULL;
 unsigned char gzbuf[CHUNK];
+int gzfd = 0;
 
 static int posixOpen(const char *zFile, int flags, int mode){
   printf("Open %s\n", zFile);
@@ -672,6 +673,7 @@ static int posixOpen(const char *zFile, int flags, int mode){
         return -1;
     }
     fprintf(stderr, "zran: built index with %d access points\n", gzlen);
+gzfd = fd;
 
   return fd;
 }
@@ -4022,7 +4024,7 @@ static int unixFileSize(sqlite3_file *id, i64 *pSize){
 
 
    assert( id );
-   if (((unixFile*)id)->h != 3) {
+   if (((unixFile*)id)->h != gzfd) {
 	   fprintf(stderr, "reading a file length on unknown fd\n");
      return SQLITE_IOERR_FSTAT;
    }
